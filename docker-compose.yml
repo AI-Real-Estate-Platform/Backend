@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dari-backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Authentication
+      - AUTH_SECRET_KEY=${AUTH_SECRET_KEY:-dev-secret-change-me-in-production}
+      
+      # Gemini API (optional, for chat features)
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      
+      # Database (SQLite by default, stored in volume)
+      - DATABASE_URL=sqlite:///./data/dari.db
+      
+      # CORS (adjust for production)
+      - CORS_ORIGINS=*
+    volumes:
+      # Persist database
+      - ./data:/app/data
+      
+      # Persist CSV data files
+      - ../data:/app/../data:ro
+      
+      # Development: mount code for hot reload (comment out for production)
+      - .:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Optional: PostgreSQL database (uncomment to use instead of SQLite)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: dari-postgres
+  #   environment:
+  #     - POSTGRES_USER=dari
+  #     - POSTGRES_PASSWORD=dari_password
+  #     - POSTGRES_DB=dari_db
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   restart: unless-stopped
+
+# volumes:
+#   postgres_data:

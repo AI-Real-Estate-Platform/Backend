@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database (will be created in container)
+# Note: listings.db is included for deployment
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env.local
+.env.*.local
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git
+.git/
+.gitignore

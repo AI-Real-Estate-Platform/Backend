@@ -6,14 +6,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # We will use SQLite for simplicity, but this is easy to swap to PostgreSQL
-raw_url = os.getenv("DATABASE_URL")
-DATABASE_URL = str(raw_url).strip() if raw_url else ""
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    # Compute absolute path so it works regardless of CWD
-    _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-    _DB_PATH = os.path.join(_BACKEND_DIR, "..", "data", "listings.db")
-    DATABASE_URL = f"sqlite:///{os.path.normpath(_DB_PATH)}"
+    # Safe fallback for Docker/Railway environments
+    # Try /app/data first (Docker volume mount), then /tmp (Railway writable), then local
+    if os.path.exists("/app/data"):
+        DATABASE_URL = "sqlite:////app/data/dari.db"
+    elif os.path.exists("/tmp"):
+        DATABASE_URL = "sqlite:////tmp/dari.db"
+    else:
+        # Local development fallback
+        _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+        _DB_PATH = os.path.join(_BACKEND_DIR, "..", "data", "listings.db")
+        DATABASE_URL = f"sqlite:///{os.path.normpath(_DB_PATH)}"
 
 # Railway sometimes injects "postgres://" instead of "postgresql://"
 if DATABASE_URL.startswith("postgres://"):

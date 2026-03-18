@@ -25,14 +25,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Copy database file to /tmp if it exists (optional - seed.py can populate it)
-RUN if [ -f listings.db ]; then cp listings.db /tmp/dari.db; fi
+# Copy database file to /tmp for seeding (if it exists)
+RUN if [ -f listings.db ]; then \
+        echo "✓ Copying listings.db to /tmp/listings_seed.db"; \
+        cp listings.db /tmp/listings_seed.db; \
+    else \
+        echo "⚠ listings.db not found in build context"; \
+    fi
 
 # Create necessary directories with proper permissions
 RUN mkdir -p /app/data /tmp && chmod 777 /app/data /tmp
-
-# Make entrypoint script executable
-RUN chmod +x entrypoint.sh
 
 # Expose port (Railway will override with $PORT)
 EXPOSE 8000
@@ -41,5 +43,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8000/api/health')" || exit 1
 
-# Run the application - Use Railway's PORT if available, otherwise default to 8000
-CMD ["./entrypoint.sh"]
+# Run the application - seed first, then start uvicorn
+CMD python seed.py && uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}

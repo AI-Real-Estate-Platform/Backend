@@ -325,9 +325,10 @@ def _location_score(row: pd.Series, prefs: UserPreferences) -> float:
 
         
     min_dist = min(distances)
-    # Use a sharper Gaussian curve so score drops faster with distance (sigma=1.2 km)
-    # A property 1.0 km away gets ~0.70, 1.5 km gets ~0.45, 3 km gets ~0.04
-    return max(0.0, _gaussian(min_dist, 0, 1.2))
+    # Use a MUCH sharper Gaussian curve so score drops very fast with distance (sigma=0.8 km)
+    # This ensures nearby neighborhoods get decent scores, but distant ones are heavily penalized
+    # A property 0.5 km away gets ~0.70, 1.0 km gets ~0.45, 2 km gets ~0.08, 3+ km gets ~0.0
+    return max(0.0, _gaussian(min_dist, 0, 0.8))
 
 
 def _quality_score(row: pd.Series, prefs: UserPreferences) -> float:
@@ -694,10 +695,10 @@ class Recommender:
     def _score_row(self, row: pd.Series, prefs: UserPreferences) -> float:
         w = self.weights.copy()
         
-        # If the user strictly asked for a neighborhood, boost the location weight 
+        # If the user strictly asked for a neighborhood, boost the location weight significantly
         # to prioritize actual geographic matches over slightly better-matching distant properties
         if prefs.neighborhoods:
-            w["location"] = 0.40  # Default is 0.20
+            w["location"] = 0.45  # Increased from 0.15 to make location more important
 
         axes: dict[str, float] = {}
 

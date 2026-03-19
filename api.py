@@ -63,7 +63,7 @@ elif os.path.isfile(_CLEAN_WITH_IMAGES):
 else:
     _rec_module.DATA_PATH = _CLEAN
 
-from recommender import Recommender, UserPreferences  # noqa: E402
+from recommender import Recommender, UserPreferences, AMENITY_COLS  # noqa: E402
 from database import Base, engine, get_db  # noqa: E402
 from models import User, SavedListing, Booking, ViewHistory  # noqa: E402
 
@@ -607,24 +607,36 @@ def clear_view_history(current_user: User = Depends(get_current_user), db: Sessi
 # Map interview answer strings → canonical CSV values
 _PROPERTY_TYPE_MAP: dict[str, str] = {
     # French interview choices
-    "appartement":       "Appartement",
-    "maison/villa":      "Villa",
-    "maison":            "Villa",
-    "villa":             "Villa",
-    "riad":              "Riad",
-    "bureau":            "Bureau",
-    "local commercial":  "Local commercial",
-    "terrain":           "Terrain",
-    "studio":            "Studio",
+    "appartement":          "Appartement",
+    "maison/villa":         "Villa",
+    "maison":               "Villa",
+    "villa":                "Villa",
+    "riad":                 "Riad",
+    "bureau":               "Bureau",
+    "local commercial":     "Local commercial",
+    "local":                "Local commercial",
+    "terrain":              "Terrain",
+    "studio":               "Studio",
     # English
-    "apartment":         "Appartement",
-    "house/villa":       "Villa",
-    "house":             "Villa",
-    "office":            "Bureau",
-    "commercial":        "Local commercial",
-    "land":              "Terrain",
-    # Voice mode (Gemini may return these)
-    "appartment":        "Appartement",
+    "apartment":            "Appartement",
+    "flat":                 "Appartement",
+    "penthouse":            "Appartement",
+    "house/villa":          "Villa",
+    "house":                "Villa",
+    "office":               "Bureau",
+    "commercial":           "Local commercial",
+    "commercial space":     "Local commercial",
+    "retail":               "Local commercial",
+    "land":                 "Terrain",
+    "plot":                 "Terrain",
+    # Voice mode — Gemini may return these spellings/capitalizations
+    "appartment":           "Appartement",
+    "Appartement":          "Appartement",
+    "Villa":                "Villa",
+    "Studio":               "Studio",
+    "Riad":                 "Riad",
+    "Bureau":               "Bureau",
+    "Terrain":              "Terrain",
 }
 
 _CITY_MAP: dict[str, str] = {
@@ -648,34 +660,49 @@ _CITY_MAP: dict[str, str] = {
 }
 
 # Map interview amenity labels → UserPreferences attribute names
+# NOTE: No duplicate keys — Python silently drops the first occurrence of a duplicate.
 _AMENITY_MAP: dict[str, str] = {
     # French
-    "parking":          "has_garage",
-    "ascenseur":        "has_ascenseur",
-    "terrasse":         "has_terrasse",
-    "terrasse/balcon":  "has_terrasse",
-    "meublé":           "has_meuble",
-    "climatisation":    "has_climatisation",
-    "sécurité":         "has_securite",
-    "sécurité 24/7":    "has_securite",
-    "cuisine équipée":  "has_cuisine_equipee",
-    "piscine":          "has_piscine",
-    "jardin":           "has_jardin",
-    "chauffage central":"has_chauffage_central",
-    # English
-    "parking":          "has_garage",
-    "elevator":         "has_ascenseur",
-    "terrace":          "has_terrasse",
-    "terrace/balcony":  "has_terrasse",
-    "furnished":        "has_meuble",
-    "ac":               "has_climatisation",
-    "air conditioning": "has_climatisation",
-    "security":         "has_securite",
-    "24/7 security":    "has_securite",
-    "equipped kitchen": "has_cuisine_equipee",
-    "pool":             "has_piscine",
-    "garden":           "has_jardin",
-    "central heating":  "has_chauffage_central",
+    "parking":              "has_garage",
+    "garage":               "has_garage",
+    "ascenseur":            "has_ascenseur",
+    "terrasse":             "has_terrasse",
+    "balcon":               "has_terrasse",
+    "terrasse/balcon":      "has_terrasse",
+    "meublé":               "has_meuble",
+    "meuble":               "has_meuble",
+    "climatisation":        "has_climatisation",
+    "clim":                 "has_climatisation",
+    "sécurité":             "has_securite",
+    "securite":             "has_securite",
+    "sécurité 24/7":        "has_securite",
+    "cuisine équipée":      "has_cuisine_equipee",
+    "cuisine equipee":      "has_cuisine_equipee",
+    "piscine":              "has_piscine",
+    "jardin":               "has_jardin",
+    "chauffage central":    "has_chauffage_central",
+    "chauffage":            "has_chauffage_central",
+    "concierge":            "has_concierge",
+    "vue mer":              "has_vue_mer",
+    # English (separate keys — no duplicates with French)
+    "elevator":             "has_ascenseur",
+    "lift":                 "has_ascenseur",
+    "terrace":              "has_terrasse",
+    "balcony":              "has_terrasse",
+    "terrace/balcony":      "has_terrasse",
+    "furnished":            "has_meuble",
+    "ac":                   "has_climatisation",
+    "air conditioning":     "has_climatisation",
+    "security":             "has_securite",
+    "24/7 security":        "has_securite",
+    "equipped kitchen":     "has_cuisine_equipee",
+    "pool":                 "has_piscine",
+    "swimming pool":        "has_piscine",
+    "garden":               "has_jardin",
+    "central heating":      "has_chauffage_central",
+    "heating":              "has_chauffage_central",
+    "sea view":             "has_vue_mer",
+    "ocean view":           "has_vue_mer",
 }
 
 
@@ -758,9 +785,14 @@ def _map_filters(filters: dict, intent: str) -> UserPreferences:
     raw_type = filters.get("type_bien") or filters.get("propertyType") or ""
     if raw_type:
         if isinstance(raw_type, list):
-            prefs.property_type = [_PROPERTY_TYPE_MAP.get(t.lower(), t.strip()) for t in raw_type if isinstance(t, str)]
+            prefs.property_type = [
+                _PROPERTY_TYPE_MAP.get(t.lower(), _PROPERTY_TYPE_MAP.get(t, t.strip()))
+                for t in raw_type if isinstance(t, str)
+            ]
         else:
-            prefs.property_type = _PROPERTY_TYPE_MAP.get(raw_type.lower(), raw_type.strip())
+            # Try lowercase lookup, then exact-case lookup, then pass through as-is
+            mapped = _PROPERTY_TYPE_MAP.get(raw_type.lower()) or _PROPERTY_TYPE_MAP.get(raw_type)
+            prefs.property_type = mapped if mapped else raw_type.strip()
 
     # ── Surface ('surface' in both) ───────────────────────────────────────────
     prefs.surface_min = _parse_surface(filters.get("surface"))
@@ -802,20 +834,75 @@ def _map_filters(filters: dict, intent: str) -> UserPreferences:
                 setattr(prefs, attr, True)
 
     # ── Visual & Architectural preferences ────────────────────────────────────
+    # Canonicalize visual preference values to match what's in the database
     if "visual_style" in filters:
-        prefs.visual_style = filters["visual_style"]
+        raw_val = str(filters["visual_style"]).lower().strip()
+        if any(k in raw_val for k in ["modern", "moderne", "contemporain"]):
+            prefs.visual_style = "Modern"
+        elif any(k in raw_val for k in ["traditional", "traditionnel", "classic", "classique"]):
+            prefs.visual_style = "Traditional"
+        elif any(k in raw_val for k in ["minimal", "simple", "epure"]):
+            prefs.visual_style = "Minimalist"
+        elif "standard" not in raw_val and "doesn't matter" not in raw_val:
+            prefs.visual_style = filters["visual_style"]  # Pass through if not standard
+    
+    if "natural_light" in filters:
+        raw_val = str(filters["natural_light"]).lower().strip()
+        if any(k in raw_val for k in ["high", "elevee", "bright", "lumineux"]):
+            prefs.natural_light = "High"
+        elif any(k in raw_val for k in ["medium", "moyen", "moderate"]):
+            prefs.natural_light = "Medium"
+        elif any(k in raw_val for k in ["low", "faible", "dark", "sombre"]):
+            prefs.natural_light = "Low"
+        elif "standard" not in raw_val and "doesn't matter" not in raw_val:
+            prefs.natural_light = filters["natural_light"]
+    
+    if "architectural_vibe" in filters:
+        raw_val = str(filters["architectural_vibe"]).lower().strip()
+        if any(k in raw_val for k in ["beldi", "marocain", "moroccan"]):
+            prefs.architectural_vibe = "Beldi/Moroccan"
+        elif any(k in raw_val for k in ["europeen", "european", "classic", "classique"]):
+            prefs.architectural_vibe = "European/Classic"
+        elif any(k in raw_val for k in ["industrial", "industriel", "loft"]):
+            prefs.architectural_vibe = "Industrial/Loft"
+        elif "standard" not in raw_val and "doesn't matter" not in raw_val:
+            prefs.architectural_vibe = filters["architectural_vibe"]
+    
+    if "furnishing_status" in filters:
+        raw_val = str(filters["furnishing_status"]).lower().strip()
+        if any(k in raw_val for k in ["furnished", "meuble", "meublee"]):
+            prefs.furnishing_status = "Fully Furnished"
+        elif any(k in raw_val for k in ["empty", "vide", "unfurnished"]):
+            prefs.furnishing_status = "Empty"
+        elif "standard" not in raw_val and "doesn't matter" not in raw_val:
+            prefs.furnishing_status = filters["furnishing_status"]
+    
+    if "floor_material" in filters:
+        raw_val = str(filters["floor_material"]).lower().strip()
+        if any(k in raw_val for k in ["parquet", "wood", "bois"]):
+            prefs.floor_material = "Parquet/Wood"
+        elif any(k in raw_val for k in ["tile", "marble", "carrelage", "marbre"]):
+            prefs.floor_material = "Tile/Marble"
+        elif any(k in raw_val for k in ["carpet", "rug", "moquette", "tapis"]):
+            prefs.floor_material = "Carpet/Rug"
+        elif "standard" not in raw_val and "doesn't matter" not in raw_val:
+            prefs.floor_material = filters["floor_material"]
+    
+    if "dominant_view" in filters:
+        raw_val = str(filters["dominant_view"]).lower().strip()
+        if any(k in raw_val for k in ["nature", "greenery", "verdure", "jardin", "park"]):
+            prefs.dominant_view = "Nature/Greenery"
+        elif any(k in raw_val for k in ["sea", "water", "mer", "ocean"]):
+            prefs.dominant_view = "Water/Sea"
+        elif any(k in raw_val for k in ["city", "urban", "ville", "urbain"]):
+            prefs.dominant_view = "Urban/City"
+        elif any(k in raw_val for k in ["blocked", "interior", "interieur", "no view"]):
+            prefs.dominant_view = "Blocked/Interior"
+        elif "standard" not in raw_val and "doesn't matter" not in raw_val:
+            prefs.dominant_view = filters["dominant_view"]
+    
     if "visual_condition" in filters:
         prefs.visual_condition = filters["visual_condition"]
-    if "natural_light" in filters:
-        prefs.natural_light = filters["natural_light"]
-    if "furnishing_status" in filters:
-        prefs.furnishing_status = filters["furnishing_status"]
-    if "floor_material" in filters:
-        prefs.floor_material = filters["floor_material"]
-    if "dominant_view" in filters:
-        prefs.dominant_view = filters["dominant_view"]
-    if "architectural_vibe" in filters:
-        prefs.architectural_vibe = filters["architectural_vibe"]
     if "color_palette" in filters:
         prefs.color_palette = filters["color_palette"]
 
@@ -997,6 +1084,22 @@ def recommend(req: RecommendRequest, current_user: User = Depends(get_current_us
     print(f"[RECOMMEND] mapped → city={prefs.city!r}  price_max={prefs.price_max}"
           f"  type={prefs.property_type!r}  surface_min={prefs.surface_min}"
           f"  bedrooms={prefs.bedrooms}  neighborhoods={prefs.neighborhoods}")
+    
+    # Log visual/architectural preferences if present
+    visual_prefs = []
+    if prefs.visual_style: visual_prefs.append(f"style={prefs.visual_style}")
+    if prefs.natural_light: visual_prefs.append(f"light={prefs.natural_light}")
+    if prefs.architectural_vibe: visual_prefs.append(f"vibe={prefs.architectural_vibe}")
+    if prefs.furnishing_status: visual_prefs.append(f"furnished={prefs.furnishing_status}")
+    if prefs.dominant_view: visual_prefs.append(f"view={prefs.dominant_view}")
+    if prefs.floor_material: visual_prefs.append(f"floor={prefs.floor_material}")
+    if visual_prefs:
+        print(f"[RECOMMEND] visual prefs → {', '.join(visual_prefs)}")
+    
+    # Log amenity preferences if present
+    amenity_prefs = [col.replace("has_", "") for col in AMENITY_COLS if getattr(prefs, col) is True]
+    if amenity_prefs:
+        print(f"[RECOMMEND] amenities → {', '.join(amenity_prefs)}")
 
     # Handle empty database case
     if len(_recommender.df) == 0:
@@ -1022,7 +1125,11 @@ def recommend(req: RecommendRequest, current_user: User = Depends(get_current_us
         min_score=req.min_score, 
         exclude_urls=req.exclude_urls
     )
-    print(f"[RECOMMEND] → {len(results)} results returned\n")
+    print(f"[RECOMMEND] → {len(results)} results returned")
+    if results:
+        top_scores = [f"{r['score']:.3f} ({r['neighborhood']})" for r in results[:3]]
+        print(f"[RECOMMEND] Top 3 scores: {top_scores}")
+    print()
     return {
         "listings": [_serialize(r) for r in results],
         "total": len(results),

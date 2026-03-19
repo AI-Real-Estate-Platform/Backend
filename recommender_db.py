@@ -36,7 +36,7 @@ class RecommenderDB(Recommender):
             df["rooms"]     = pd.to_numeric(df["rooms"],     errors="coerce").astype("Int64")
             df["bedrooms"]  = pd.to_numeric(df["bedrooms"],  errors="coerce").astype("Int64")
             df["bathrooms"] = pd.to_numeric(df["bathrooms"], errors="coerce").astype("Int64")
-            for col in AMENITY_COLS: # Make sure boolean columns map to 0/1 integers for scoring logic
+            for col in AMENITY_COLS + ["equipped"]:  # Match Recommender._load() behavior
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 

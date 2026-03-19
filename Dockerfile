@@ -25,12 +25,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Copy database file to /tmp for seeding (if it exists)
+# Copy database file to /tmp for seeding (CRITICAL for Railway)
 RUN if [ -f listings.db ]; then \
         echo "✓ Copying listings.db to /tmp/listings_seed.db"; \
         cp listings.db /tmp/listings_seed.db; \
+        ls -lh /tmp/listings_seed.db; \
     else \
-        echo "⚠ listings.db not found in build context"; \
+        echo "❌ ERROR: listings.db not found in build context!"; \
+        ls -la | grep -i listing || true; \
     fi
 
 # Create necessary directories with proper permissions
@@ -43,5 +45,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8000/api/health')" || exit 1
 
-# Run the application - seed first, then start uvicorn
-CMD python seed.py && uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}
+# Run the application - startup event handles seeding
+CMD uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}

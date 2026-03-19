@@ -139,6 +139,82 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Startup Event - Seed Database
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def seed_on_startup():
+    """Seed listings from bundled DB if table is empty."""
+    import sqlite3
+    import pandas as pd
+    
+    print("\n=== STARTUP: Checking database seed ===", flush=True)
+    
+    try:
+        # Check if listings table has data
+        existing = pd.read_sql("SELECT COUNT(*) as count FROM listings", engine)
+        count = existing['count'].iloc[0]
+        if count > 0:
+            print(f"✓ Listings already seeded: {count} rows.", flush=True)
+            return
+    except Exception as e:
+        print(f"⚠ Table check failed (probably doesn't exist yet): {e}", flush=True)
+    
+    # Find source database
+    source_candidates = [
+        "/tmp/listings_seed.db",
+        "/app/listings.db", 
+        "listings.db",
+        "../data/listings.db"
+    ]
+    
+    print(f"🔍 Looking for source database...", flush=True)
+    for candidate in source_candidates:
+        exists = os.path.exists(candidate)
+        print(f"   {candidate}: {'✓ FOUND' if exists else '✗ not found'}", flush=True)
+    
+    source_path = next((p for p in source_candidates if os.path.exists(p)), None)
+    
+    if not source_path:
+        print(f"❌ Seed file not found. Checked: {source_candidates}", flush=True)
+        return
+    
+    print(f"→ Seeding listings from {source_path}...", flush=True)
+    
+    try:
+        conn = sqlite3.connect(source_path)
+        
+        # Check what tables exist
+        tables_df = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)
+        print(f"   Tables in source: {tables_df['name'].tolist()}", flush=True)
+        
+        df = pd.read_sql("SELECT * FROM listings", conn)
+        conn.close()
+        
+        if df.empty:
+            print("❌ Source DB has no listings.", flush=True)
+            return
+        
+        print(f"   Found {len(df)} listings in source", flush=True)
+        print(f"   Columns: {list(df.columns)[:10]}...", flush=True)
+        
+        # Write to target database
+        df.to_sql("listings", engine, if_exists="replace", index=False)
+        print(f"✅ Seeded {len(df)} listings successfully.", flush=True)
+        
+        # Reload the recommender with fresh data
+        global _recommender
+        print("🔄 Reloading recommender with seeded data...", flush=True)
+        _recommender = RecommenderDB()
+        print(f"✅ Recommender reloaded: {len(_recommender.df)} listings", flush=True)
+        
+    except Exception as e:
+        print(f"❌ Seeding failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Authentication
 # ─────────────────────────────────────────────────────────────────────────────
 

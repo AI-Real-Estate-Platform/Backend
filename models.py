@@ -70,14 +70,17 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     full_name = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    agency_name = Column(String, nullable=True)  # agent only
     is_active = Column(Boolean, default=True, nullable=False)
+    role = Column(String, default="client", nullable=False)  # 'client' | 'agent'
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     reset_token = Column(String, index=True, nullable=True)
     reset_token_expires = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     saved_listings = relationship("SavedListing", back_populates="user", cascade="all, delete-orphan")
-    bookings = relationship("Booking", back_populates="user", cascade="all, delete-orphan")
+    bookings = relationship("Booking", back_populates="user", cascade="all, delete-orphan", foreign_keys="[Booking.user_id]")
     view_history = relationship("ViewHistory", back_populates="user", cascade="all, delete-orphan")
 
 
@@ -99,13 +102,15 @@ class Booking(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)  # agent who owns the listing
     listing_url = Column(String, nullable=False, index=True)
     booking_date = Column(DateTime(timezone=True), nullable=False)
     status = Column(String, default="pending", nullable=False)  # pending, confirmed, cancelled, completed
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    user = relationship("User", back_populates="bookings")
+    user = relationship("User", back_populates="bookings", foreign_keys=[user_id])
+    agent = relationship("User", foreign_keys=[agent_id])
 
 
 class ViewHistory(Base):
@@ -117,3 +122,41 @@ class ViewHistory(Base):
     viewed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     user = relationship("User", back_populates="view_history")
+
+
+class ChatConversation(Base):
+    __tablename__ = "chat_conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String, nullable=True)
+    lang = Column(String, nullable=False, default="EN")
+    messages = Column(Text, nullable=False, default="[]")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AgentListing(Base):
+    __tablename__ = "agent_listings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    listing_url = Column(String, unique=True, index=True, nullable=False)  # dari://agent-listing/{id}
+    listing_data = Column(Text, nullable=False)   # JSON
+    intent = Column(String, default="sell", nullable=False)  # 'sell' | 'rent'
+    published_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    agent = relationship("User", foreign_keys=[agent_id])
+    likes = relationship("ListingLike", back_populates="listing", cascade="all, delete-orphan")
+
+
+class ListingLike(Base):
+    __tablename__ = "listing_likes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    listing_id = Column(Integer, ForeignKey("agent_listings.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    liked_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    listing = relationship("AgentListing", back_populates="likes")
+    user = relationship("User", foreign_keys=[user_id])

@@ -18,18 +18,24 @@ Dependencies (add to venv)
   pip install fastapi uvicorn[standard]
 """
 
+import json
 import os
+import pandas as _pd
+import random
 import re
 import secrets
+import smtplib
 import sys
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import google.auth
-from google import genai
+from google import genai        
 from google.genai import types
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -37,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, constr
+from pydantic import BaseModel, EmailStr, constr, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -65,7 +71,7 @@ else:
 
 from recommender import Recommender, UserPreferences, AMENITY_COLS  # noqa: E402
 from database import Base, engine, get_db  # noqa: E402
-from models import User, SavedListing, Booking, ViewHistory  # noqa: E402
+from models import User, SavedListing, Booking, ViewHistory, ChatConversation, AgentListing, ListingLike  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
 # App setup
@@ -89,6 +95,21 @@ def _ensure_user_columns() -> None:
             conn.execute(text("ALTER TABLE users ADD COLUMN reset_token VARCHAR"))
         if "reset_token_expires" not in existing:
             conn.execute(text("ALTER TABLE users ADD COLUMN reset_token_expires DATETIME"))
+        if "role" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR NOT NULL DEFAULT 'client'"))
+        if "phone" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR"))
+        if "agency_name" not in existing:
+            conn.execute(text("ALTER TABLE users ADD COLUMN agency_name VARCHAR"))
+        # Ensure chat_conversations table exists
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+                messages TEXT NOT NULL DEFAULT '[]',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
 
 
 def _ensure_saved_listings_columns() -> None:
@@ -107,12 +128,44 @@ def _ensure_saved_listings_columns() -> None:
 _ensure_user_columns()
 _ensure_saved_listings_columns()
 
-# CORS configuration - allow specific origins from environment variable
-cors_origins = os.getenv("CORS_ORIGINS", "*")
-if cors_origins == "*":
-    allowed_origins = ["*"]
+
+def _ensure_agent_listing_tables() -> None:
+    """Create agent_listings and listing_likes tables if they don't exist."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agent_listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL REFERENCES users(id),
+                listing_url VARCHAR NOT NULL UNIQUE,
+                listing_data TEXT NOT NULL,
+                intent VARCHAR NOT NULL DEFAULT 'sell',
+                published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS listing_likes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_id INTEGER NOT NULL REFERENCES agent_listings(id),
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                liked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(listing_id, user_id)
+            )
+        """))
+
+
+_ensure_agent_listing_tables()
+
+# CORS configuration
+_cors_env = os.getenv("CORS_ORIGINS", "")
+_default_origins = [
+    "http://localhost:3000", "http://localhost:5173",
+    "http://127.0.0.1:3000", "http://127.0.0.1:5173",
+]
+if _cors_env and _cors_env != "*":
+    allowed_origins = list({o.strip() for o in _cors_env.split(",") if o.strip()} | set(_default_origins))
 else:
-    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
+    allowed_origins = _default_origins
 
 app.add_middleware(
     CORSMiddleware,
@@ -220,7 +273,14 @@ async def seed_on_startup():
 
 SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "dev-secret-change-me")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30  # 30 days
+
+# ── SMTP config (set in .env for real email, otherwise falls back to console) ─
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER) or "noreply@dari.ma"
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -230,6 +290,9 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: constr(min_length=8)
     full_name: Optional[str] = None
+    role: Optional[str] = "client"  # 'client' | 'agent'
+    phone: Optional[str] = None
+    agency_name: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -250,12 +313,16 @@ class PasswordResetConfirm(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+    role: Optional[str] = None
 
 
 class UserOut(BaseModel):
     id: int
     email: EmailStr
     full_name: Optional[str] = None
+    phone: Optional[str] = None
+    agency_name: Optional[str] = None
+    role: str = "client"
     created_at: datetime
 
     class Config:
@@ -284,13 +351,46 @@ def _get_user_by_email(db: Session, email: str) -> Optional[User]:
 
 
 def _set_password_reset_token(db: Session, user: User) -> str:
-    token = secrets.token_urlsafe(32)
-    user.reset_token = token
-    user.reset_token_expires = datetime.utcnow() + timedelta(minutes=30)
+    code = f"{random.randint(0, 999999):06d}"
+    user.reset_token = code
+    user.reset_token_expires = datetime.utcnow() + timedelta(minutes=15)
     db.add(user)
     db.commit()
     db.refresh(user)
-    return token
+    return code
+
+
+def _send_reset_email(to_email: str, code: str) -> None:
+    """Send OTP code by email. Falls back to console log if SMTP is not configured."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        print(f"[DARI] Password reset OTP for {to_email}: {code}  (configure SMTP_* env vars to send real emails)")
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Dari — Code de réinitialisation"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    plain = (
+        f"Votre code de réinitialisation Dari : {code}\n\n"
+        "Ce code est valable 15 minutes.\n"
+        "Si vous n'avez pas demandé cette réinitialisation, ignorez cet email."
+    )
+    html = f"""
+    <div style="font-family:sans-serif;max-width:400px;margin:auto;padding:32px">
+      <h2 style="font-size:24px;margin-bottom:8px">Darī</h2>
+      <p style="color:#666">Votre code de réinitialisation :</p>
+      <div style="font-size:40px;font-weight:bold;letter-spacing:8px;color:#B57329;margin:24px 0">{code}</div>
+      <p style="color:#888;font-size:13px">Valable 15 minutes. Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
+    </div>
+    """
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.starttls()
+        smtp.login(SMTP_USER, SMTP_PASSWORD)
+        smtp.sendmail(SMTP_FROM, to_email, msg.as_string())
 
 
 def get_current_user(
@@ -320,10 +420,20 @@ def register_user(payload: RegisterRequest, db: Session = Depends(get_db)):
     existing = _get_user_by_email(db, payload.email)
     if existing:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+    role = payload.role if payload.role in ("client", "agent") else "client"
+    if role == "agent":
+        if not (payload.phone or "").strip() or not (payload.agency_name or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Agents must provide phone and agency_name at registration",
+            )
     user = User(
         email=payload.email,
         full_name=payload.full_name,
         hashed_password=_hash_password(payload.password),
+        role=role,
+        phone=payload.phone,
+        agency_name=payload.agency_name,
     )
     db.add(user)
     db.commit()
@@ -340,16 +450,20 @@ def login_user(payload: LoginRequest, db: Session = Depends(get_db)):
             detail="Invalid email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token = _create_access_token({"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    access_token = _create_access_token({"sub": user.email, "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer", "role": user.role}
 
 
 @app.post("/api/auth/reset/request")
 def request_password_reset(payload: PasswordResetRequest, db: Session = Depends(get_db)):
     user = _get_user_by_email(db, payload.email)
     if user:
-        token = _set_password_reset_token(db, user)
-        return {"ok": True, "reset_token": token, "expires_in_minutes": 30}
+        code = _set_password_reset_token(db, user)
+        try:
+            _send_reset_email(user.email, code)
+        except Exception as exc:
+            print(f"[DARI] Failed to send reset email to {user.email}: {exc}")
+    # Always return ok to prevent email enumeration
     return {"ok": True}
 
 
@@ -372,6 +486,30 @@ def confirm_password_reset(payload: PasswordResetConfirm, db: Session = Depends(
 
 @app.get("/api/auth/me", response_model=UserOut)
 def read_current_user(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+class UpdateProfileRequest(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    agency_name: Optional[str] = None
+    # role is immutable after registration — removed
+
+
+@app.patch("/api/auth/me", response_model=UserOut)
+def update_current_user(
+    payload: UpdateProfileRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if payload.full_name is not None:
+        current_user.full_name = payload.full_name
+    if payload.phone is not None:
+        current_user.phone = payload.phone
+    if payload.agency_name is not None:
+        current_user.agency_name = payload.agency_name
+    db.commit()
+    db.refresh(current_user)
     return current_user
 
 
@@ -398,6 +536,7 @@ class BookingRequest(BaseModel):
     listing_url: str
     booking_date: datetime
     notes: Optional[str] = None
+    agent_id: Optional[int] = None  # ID of the agent who owns the listing
 
 
 class BookingUpdate(BaseModel):
@@ -472,11 +611,106 @@ def remove_saved_listing(listing_id: int, current_user: User = Depends(get_curre
     return {"ok": True, "message": "Listing removed from saved items"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent Listings — Publish / Manage / Stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PublishListingRequest(BaseModel):
+    listing_data: dict
+    intent: Optional[str] = "sell"
+
+
+@app.post("/api/agent/listings")
+def publish_agent_listing(payload: PublishListingRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Publish a new agent listing."""
+    listing = AgentListing(
+        agent_id=current_user.id,
+        listing_url="",  # filled after insert to get the id
+        listing_data=json.dumps(payload.listing_data),
+        intent=payload.intent or "sell",
+    )
+    db.add(listing)
+    db.flush()  # get the auto-generated id
+    listing.listing_url = f"dari://agent-listing/{listing.id}"
+    db.commit()
+    db.refresh(listing)
+    return {"ok": True, "id": listing.id, "listing_url": listing.listing_url}
+
+
+@app.get("/api/agent/listings")
+def get_agent_listings(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get all listings published by the current agent, with like/save stats."""
+    listings = (
+        db.query(AgentListing)
+        .filter(AgentListing.agent_id == current_user.id, AgentListing.is_active == True)
+        .order_by(AgentListing.published_at.desc())
+        .all()
+    )
+
+    result = []
+    for lst in listings:
+        # Likes: users who liked this listing
+        likes = (
+            db.query(ListingLike, User)
+            .join(User, User.id == ListingLike.user_id)
+            .filter(ListingLike.listing_id == lst.id)
+            .all()
+        )
+        liked_by = [
+            {"email": u.email, "full_name": u.full_name or u.email.split("@")[0]}
+            for _, u in likes
+        ]
+
+        # Saves: count of SavedListing rows referencing this listing_url
+        save_count = db.query(SavedListing).filter(SavedListing.listing_url == lst.listing_url).count()
+
+        result.append({
+            "id": lst.id,
+            "listing_url": lst.listing_url,
+            "listing_data": json.loads(lst.listing_data),
+            "intent": lst.intent,
+            "published_at": lst.published_at,
+            "like_count": len(liked_by),
+            "liked_by": liked_by,
+            "save_count": save_count,
+        })
+
+    return {"listings": result, "total": len(result)}
+
+
+@app.delete("/api/agent/listings/{listing_id}")
+def delete_agent_listing(listing_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Soft-delete (deactivate) an agent listing."""
+    lst = db.query(AgentListing).filter(
+        AgentListing.id == listing_id,
+        AgentListing.agent_id == current_user.id,
+    ).first()
+    if not lst:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    lst.is_active = False
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/agent/listings/{listing_id}/like")
+def like_agent_listing(listing_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Record that the current user liked an agent listing (idempotent)."""
+    lst = db.query(AgentListing).filter(AgentListing.id == listing_id, AgentListing.is_active == True).first()
+    if not lst:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    existing = db.query(ListingLike).filter_by(listing_id=listing_id, user_id=current_user.id).first()
+    if not existing:
+        db.add(ListingLike(listing_id=listing_id, user_id=current_user.id))
+        db.commit()
+    return {"ok": True}
+
+
 @app.post("/api/user/bookings")
 def create_booking(payload: BookingRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Create a property viewing/booking"""
     booking = Booking(
         user_id=current_user.id,
+        agent_id=payload.agent_id,
         listing_url=payload.listing_url,
         booking_date=payload.booking_date,
         notes=payload.notes,
@@ -516,6 +750,58 @@ def get_bookings(current_user: User = Depends(get_current_user), db: Session = D
         ],
         "total": len(bookings)
     }
+
+
+@app.get("/api/agent/bookings")
+def get_agent_bookings(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get all bookings made on the current agent's listings (inbound client bookings)"""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only agents can access this endpoint")
+    bookings = (
+        db.query(Booking)
+        .filter(Booking.agent_id == current_user.id)
+        .order_by(Booking.booking_date.desc())
+        .all()
+    )
+    result = []
+    for b in bookings:
+        client = db.query(User).filter(User.id == b.user_id).first()
+        result.append({
+            "id": b.id,
+            "listing_url": b.listing_url,
+            "booking_date": b.booking_date,
+            "status": b.status,
+            "notes": b.notes,
+            "created_at": b.created_at,
+            "client": {
+                "id": client.id if client else None,
+                "full_name": client.full_name if client else None,
+                "email": client.email if client else None,
+                "phone": client.phone if client else None,
+            } if client else None,
+        })
+    return {"bookings": result, "total": len(result)}
+
+
+@app.patch("/api/agent/bookings/{booking_id}")
+def agent_update_booking(booking_id: int, payload: BookingUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Agent confirms or cancels a client's booking request"""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only agents can access this endpoint")
+    booking = db.query(Booking).filter(
+        Booking.id == booking_id,
+        Booking.agent_id == current_user.id,
+    ).first()
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if payload.status:
+        booking.status = payload.status
+    if payload.notes is not None:
+        booking.notes = payload.notes
+    db.add(booking)
+    db.commit()
+    db.refresh(booking)
+    return {"ok": True, "booking": {"id": booking.id, "status": booking.status}}
 
 
 @app.patch("/api/user/bookings/{booking_id}")
@@ -936,6 +1222,186 @@ def _make_title(row: dict) -> str:
     return " – ".join(parts) if parts else "Bien immobilier"
 
 
+# Maps equipements label (lowercased) → AMENITY_COLS column name
+_EQUIP_TO_AMENITY: dict[str, str] = {
+    "ascenseur": "has_ascenseur", "elevator": "has_ascenseur",
+    "terrasse": "has_terrasse", "terrasse/balcon": "has_terrasse", "terrace/balcony": "has_terrasse", "balcon": "has_terrasse",
+    "piscine": "has_piscine", "pool": "has_piscine",
+    "parking": "has_garage", "garage": "has_garage",
+    "meublé": "has_meuble", "furnished": "has_meuble", "مفروش": "has_meuble",
+    "clim": "has_climatisation", "climatisation": "has_climatisation", "ac": "has_climatisation",
+    "sécurité": "has_securite", "sécurité 24/7": "has_securite", "security": "has_securite", "24/7 security": "has_securite",
+    "jardin": "has_jardin", "garden": "has_jardin",
+    "vue mer": "has_vue_mer",
+    "cuisine équipée": "has_cuisine_equipee", "equipped kitchen": "has_cuisine_equipee",
+    "concierge": "has_concierge",
+    "salon européen": "has_salon_europeen",
+    "salon marocain": "has_salon_marocain",
+    "antenne parabolique": "has_antenne_parabolique",
+    "double vitrage": "has_double_vitrage",
+    "façade extérieure": "has_facade_exterieure",
+    "cheminée": "has_cheminee",
+    "machine à laver": "has_machine_laver",
+    "porte blindée": "has_porte_blindee",
+    "chauffage central": "has_chauffage_central",
+    "chambre rangement": "has_chambre_rangement",
+    "entre-seul": "has_entre_seul",
+    "four": "has_four",
+    "micro-ondes": "has_micro_ondes",
+    "réfrigérateur": "has_refrigerateur",
+}
+
+
+def _agent_listing_to_df_row(agent_lst: "AgentListing") -> dict:
+    """Convert an AgentListing ORM object to a dict matching the recommender DataFrame schema."""
+    data = json.loads(agent_lst.listing_data) if agent_lst.listing_data else {}
+
+    def _safe_num(val, cast=float):
+        try:
+            return cast(float(str(val)))
+        except (ValueError, TypeError):
+            return None
+
+    city         = str(data.get("ville") or data.get("city") or "").strip()
+    neighborhood = str(data.get("quartier") or data.get("neighborhood") or "").strip()
+    prop_type    = str(data.get("type_bien") or data.get("property_type") or "").strip()
+    intent       = agent_lst.intent or "sell"
+    transaction  = "Vente" if intent == "sell" else "Location"
+
+    # Images joined as pipe-separated string (same as scraped listings)
+    media = data.get("media") or []
+    images_list = []
+    if isinstance(media, list):
+        for item in media:
+            u = item.get("url", "") if isinstance(item, dict) else str(item)
+            if u:
+                images_list.append(u)
+    images_str = " | ".join(images_list)
+
+    # Build amenity flags from equipements labels
+    amenity_row = {col: 0 for col in AMENITY_COLS}
+    for label in (data.get("equipements") or data.get("tags") or []):
+        col = _EQUIP_TO_AMENITY.get(str(label).lower().strip())
+        if col:
+            amenity_row[col] = 1
+
+    row = {
+        "url":              agent_lst.listing_url,
+        "price":            _safe_num(data.get("prix") or data.get("price"), float) or 0.0,
+        "surface":          _safe_num(data.get("surface"), float),
+        "rooms":            _safe_num(data.get("pieces") or data.get("rooms"), int),
+        "bedrooms":         _safe_num(data.get("chambres") or data.get("bedrooms") or data.get("beds"), int),
+        "bathrooms":        _safe_num(data.get("salles_bain") or data.get("bathrooms"), int),
+        "city":             city,
+        "neighborhood":     neighborhood,
+        "property_type":    prop_type,
+        "transaction_type": transaction,
+        "state":            str(data.get("etat") or data.get("state") or ""),
+        "standing":         "",
+        "description":      str(data.get("description") or ""),
+        "phone_number":     str(data.get("phone_number") or ""),
+        "map_link":         "",
+        "address":          str(data.get("adresse") or data.get("address") or ""),
+        "images":           images_str,
+        # Visual attributes — not available from agent interview
+        "visual_style": "", "natural_light": "", "visual_condition": "",
+        "furnishing_status": "", "floor_material": "", "dominant_view": "",
+        "architectural_vibe": "", "color_palette": "",
+        **amenity_row,
+    }
+    return row
+
+
+def _serialize_agent_listing(agent_lst: "AgentListing") -> dict:
+    """Convert an AgentListing ORM object to the same shape as _serialize output."""
+    data = json.loads(agent_lst.listing_data) if agent_lst.listing_data else {}
+
+    def _safe_int(val):
+        try:
+            v = int(float(str(val)))
+            return v if v > 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    # Core fields
+    try:
+        price = int(float(str(data.get("prix") or data.get("price") or 0)))
+    except (ValueError, TypeError):
+        price = 0
+
+    city          = str(data.get("ville") or data.get("city") or "").strip()
+    neighborhood  = str(data.get("quartier") or data.get("neighborhood") or "").strip()
+    property_type = str(data.get("type_bien") or data.get("property_type") or "").strip()
+    rooms         = _safe_int(data.get("pieces") or data.get("rooms"))
+    beds          = _safe_int(data.get("chambres") or data.get("bedrooms") or data.get("beds"))
+    baths         = _safe_int(data.get("salles_bain") or data.get("bathrooms"))
+
+    surface_raw = data.get("surface", "")
+    area = ""
+    try:
+        sv = float(str(surface_raw)) if surface_raw not in ("", None) else float("nan")
+        if sv == sv:  # NaN check
+            area = f"{int(sv)} m²"
+    except (ValueError, TypeError):
+        area = ""
+
+    # Media → images list (may be base64 data URLs or http URLs)
+    media = data.get("media") or []
+    images = []
+    if isinstance(media, list):
+        for item in media:
+            url = item.get("url", "") if isinstance(item, dict) else str(item)
+            if url:
+                images.append(url)
+
+    # Equipements → tags
+    equipements = data.get("equipements") or data.get("tags") or []
+    tags = equipements if isinstance(equipements, list) else []
+
+    # Transaction type from agent intent
+    intent = agent_lst.intent or "sell"
+    transaction_type = "Vente" if intent == "sell" else "Location"
+
+    # Title: use agent-provided or auto-generate
+    title = (
+        str(data.get("titre") or data.get("title") or "").strip()
+        or _make_title({"property_type": property_type, "bedrooms": beds, "state": data.get("etat", "")})
+    )
+
+    url = agent_lst.listing_url
+    return {
+        "id":               url,
+        "url":              url,
+        "title":            title,
+        "location":         f"{city}, {neighborhood}" if neighborhood else city,
+        "city":             city,
+        "neighborhood":     neighborhood,
+        "price":            price,
+        "price_formatted":  _format_price(price),
+        "images":           images,
+        "image":            images[0] if images else "",
+        "beds":             beds,
+        "baths":            baths,
+        "rooms":            rooms,
+        "area":             area,
+        "property_type":    property_type,
+        "state":            str(data.get("etat") or data.get("state") or ""),
+        "standing":         "",
+        "transaction_type": transaction_type,
+        "visual_style":     "",
+        "natural_light":    "",
+        "visual_condition": "",
+        "score":            1.0,
+        "tags":             tags,
+        "match_tags":       tags[:3],
+        "description":      str(data.get("description") or ""),
+        "phone_number":     str(data.get("phone_number") or ""),
+        "map_link":         "",
+        "address":          str(data.get("adresse") or data.get("address") or ""),
+        "is_agent_listing": True,
+    }
+
+
 def _serialize(listing: dict) -> dict:
     """Convert a recommender result dict to the API response shape."""
     url = listing.get("url", "")
@@ -1029,7 +1495,8 @@ def _serialize(listing: dict) -> dict:
         "score":         round(float(listing.get("score", 0)), 3),
         "tags":          tags, # Return all matched amenities
         "match_tags":    listing.get("match_tags", []),
-        "description":   str(listing.get("description") or ""),
+        "description":            str(listing.get("description") or ""),
+        "description_normalized": str(listing.get("description_normalized") or ""),
         "phone_number":  str(listing.get("phone_number") or ""),
         "map_link":      str(listing.get("map_link") or ""),
         "address":       str(listing.get("address") or ""),
@@ -1057,17 +1524,29 @@ class ChatMessage(BaseModel):
     id: str
     type: str
     text: str
+    image: Optional[str] = None  # Base64 encoded image data
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     filters: dict = {}
+    conversation_id: Optional[int] = None
+
+class ConversationCreate(BaseModel):
+    lang: str = "EN"
+
+    @field_validator("lang")
+    @classmethod
+    def validate_lang(cls, v: str) -> str:
+        if v not in {"EN", "FR", "AR"}:
+            raise ValueError("lang must be one of: EN, FR, AR")
+        return v
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/recommend")
-def recommend(req: RecommendRequest, current_user: User = Depends(get_current_user)):
+def recommend(req: RecommendRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Accept interview filters, run the recommender, return ranked listings.
 
@@ -1119,15 +1598,39 @@ def recommend(req: RecommendRequest, current_user: User = Depends(get_current_us
             },
         }
 
-    results = _recommender.recommend(
-        prefs, 
-        top_n=req.top_n, 
-        min_score=req.min_score, 
-        exclude_urls=req.exclude_urls
-    )
+    # ── Merge active agent listings into the recommender df before scoring ──
+    agent_rows = [
+        _agent_listing_to_df_row(al)
+        for al in db.query(AgentListing).filter(AgentListing.is_active == True).all()
+    ]
+    if agent_rows:
+        agent_df = _pd.DataFrame(agent_rows)
+        # Align columns with main df (fill missing cols with 0 / "")
+        for col in _recommender.df.columns:
+            if col not in agent_df.columns:
+                agent_df[col] = 0 if col in AMENITY_COLS else ""
+        agent_df = agent_df[_recommender.df.columns]  # same column order
+        original_df = _recommender.df
+        _recommender.df = _pd.concat([original_df, agent_df], ignore_index=True)
+        print(f"[RECOMMEND] merged {len(agent_rows)} agent listing(s) into recommender df")
+    else:
+        original_df = None
+
+    try:
+        results = _recommender.recommend(
+            prefs,
+            top_n=req.top_n,
+            min_score=req.min_score,
+            exclude_urls=req.exclude_urls
+        )
+    finally:
+        # Always restore original df so we don't mutate the singleton permanently
+        if agent_rows:
+            _recommender.df = original_df
+
     print(f"[RECOMMEND] → {len(results)} results returned")
     if results:
-        top_scores = [f"{r['score']:.3f} ({r['neighborhood']})" for r in results[:3]]
+        top_scores = [f"{r['score']:.3f} ({r.get('neighborhood','')})" for r in results[:3]]
         print(f"[RECOMMEND] Top 3 scores: {top_scores}")
     print()
     return {
@@ -1146,7 +1649,7 @@ def recommend(req: RecommendRequest, current_user: User = Depends(get_current_us
 
 
 @app.post("/api/swipe")
-def swipe(req: SwipeRequest, current_user: User = Depends(get_current_user)):
+def swipe(req: SwipeRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Update recommender weights based on swipe feedback.
 
@@ -1159,6 +1662,15 @@ def swipe(req: SwipeRequest, current_user: User = Depends(get_current_user)):
             req.disliked_urls,
             learning_rate=req.learning_rate,
         )
+    # Record likes on agent-published listings
+    for url in (req.liked_urls or []):
+        if url.startswith("dari://agent-listing/"):
+            lst = db.query(AgentListing).filter_by(listing_url=url, is_active=True).first()
+            if lst:
+                existing = db.query(ListingLike).filter_by(listing_id=lst.id, user_id=current_user.id).first()
+                if not existing:
+                    db.add(ListingLike(listing_id=lst.id, user_id=current_user.id))
+    db.commit()
     return {
         "weights": _recommender.weights,
         "ok": True,
@@ -1224,35 +1736,325 @@ def health():
     }
 
 
+@app.get("/api/user/chat-history")
+def get_chat_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return the saved conversation for the current user."""
+    import json
+    row = db.query(ChatConversation).filter(ChatConversation.user_id == current_user.id).first()
+    if not row:
+        return {"messages": [], "updated_at": None}
+    return {"messages": json.loads(row.messages), "updated_at": row.updated_at}
+
+
+@app.post("/api/user/chat-history")
+def save_chat_history(payload: dict, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Upsert the full conversation for the current user."""
+    import json
+    messages = payload.get("messages", [])
+    row = db.query(ChatConversation).filter(ChatConversation.user_id == current_user.id).first()
+    if row:
+        row.messages = json.dumps(messages)
+    else:
+        row = ChatConversation(user_id=current_user.id, messages=json.dumps(messages))
+        db.add(row)
+    db.commit()
+    return {"saved": True}
+
+
+@app.delete("/api/user/chat-history")
+def clear_chat_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete saved conversation for the current user."""
+    db.query(ChatConversation).filter(ChatConversation.user_id == current_user.id).delete()
+    db.commit()
+    return {"cleared": True}
+
+
+@app.get("/api/user/conversations")
+def list_conversations(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(ChatConversation)
+        .filter(ChatConversation.user_id == current_user.id)
+        .order_by(ChatConversation.updated_at.desc())
+        .all()
+    )
+    result = []
+    for row in rows:
+        try:
+            messages = json.loads(row.messages or "[]")
+        except (json.JSONDecodeError, TypeError):
+            messages = []
+        user_messages = [m for m in messages if m.get("type") == "user"]
+        preview = user_messages[0]["text"][:60] if user_messages else ""
+        result.append({
+            "id": row.id,
+            "title": row.title,
+            "lang": row.lang,
+            "created_at": row.updated_at.isoformat() if row.updated_at else None,
+            "preview": preview,
+        })
+    return result
+
+
+@app.post("/api/user/conversations", status_code=201)
+def create_conversation(
+    payload: ConversationCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    conv = ChatConversation(
+        user_id=current_user.id,
+        messages="[]",
+        lang=payload.lang,
+    )
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return {"id": conv.id}
+
+
+@app.get("/api/user/conversations/{conv_id}")
+def get_conversation(
+    conv_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(ChatConversation).filter(
+        ChatConversation.id == conv_id,
+        ChatConversation.user_id == current_user.id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    try:
+        messages = json.loads(row.messages or "[]")
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    return {
+        "id": row.id,
+        "title": row.title,
+        "lang": row.lang,
+        "messages": messages,
+        "created_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+@app.delete("/api/user/conversations/{conv_id}")
+def delete_conversation(
+    conv_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(ChatConversation).filter(
+        ChatConversation.id == conv_id,
+        ChatConversation.user_id == current_user.id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.delete(row)
+    db.commit()
+    return {"deleted": True}
+
+
+@app.post("/api/user/conversations/{conv_id}/generate-title")
+def generate_conversation_title(
+    conv_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(ChatConversation).filter(
+        ChatConversation.id == conv_id,
+        ChatConversation.user_id == current_user.id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    try:
+        messages = json.loads(row.messages or "[]")
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+
+    user_msgs = [m for m in messages if m.get("type") == "user"]
+    bot_msgs = [m for m in messages if m.get("type") == "bot"]
+
+    if not user_msgs or not bot_msgs:
+        return {"title": None}
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {"title": None}
+
+    lang_names = {"EN": "English", "FR": "French", "AR": "Moroccan Arabic (Darija)"}
+    lang_name = lang_names.get(row.lang, "English")
+
+    prompt = (
+        f"Summarize the following conversation topic in 5 words or fewer. "
+        f"Respond in {lang_name} only. No punctuation, no quotes.\n"
+        f"User: {user_msgs[0]['text'][:200]}\n"
+        f"Assistant: {bot_msgs[0]['text'][:200]}"
+    )
+
+    try:
+        client_gemini = genai.Client(api_key=api_key)
+        response = client_gemini.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        title = response.text.strip()[:80]
+        row.title = title
+        db.commit()
+        return {"title": title}
+    except Exception:
+        return {"title": None}
+
+
 @app.post("/api/chat")
-def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
+def chat(req: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Sends conversational messages to Gemini to act as Dari, the assistant.
+    Uses RAG: injects relevant listings from the DB and the user's saved listings
+    into the system prompt so Gemini can answer grounded questions.
     """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return {"reply": "Désolé, la clé de l'API Gemini n'est pas configurée sur ce serveur."}
 
     try:
+        import base64, json
+
+        # ── RAG: fetch saved listings for this user ────────────────────────────
+        saved_rows = (
+            db.query(SavedListing)
+            .filter(SavedListing.user_id == current_user.id)
+            .order_by(SavedListing.saved_at.desc())
+            .limit(10)
+            .all()
+        )
+        saved_listings = []
+        for s in saved_rows:
+            data = json.loads(s.listing_data) if s.listing_data else {}
+            if data:
+                saved_listings.append(data)
+
+        # ── RAG: retrieve top relevant listings via recommender ────────────────
+        rag_listings = []
+        try:
+            # Merge static filters with any city/neighborhood keywords from the full conversation
+            merged_filters = dict(req.filters or {})
+            conv_text = " ".join(m.text for m in req.messages).lower()
+            if not merged_filters.get("ville") and not merged_filters.get("city"):
+                for city, variants in {
+                    "Casablanca": ["casablanca", "casa", "belvédère", "belveder", "maarif", "ain diab", "triangle d'or", "anfa", "bourgogne"],
+                    "Rabat": ["rabat", "agdal", "hay riad", "souissi"],
+                    "Marrakech": ["marrakech", "guéliz", "hivernage"],
+                    "Tanger": ["tanger", "tangier"],
+                    "Agadir": ["agadir"],
+                    "Fès": ["fès", "fez"],
+                }.items():
+                    if any(v in conv_text for v in variants):
+                        merged_filters["ville"] = city
+                        break
+            prefs = _map_filters(merged_filters)
+            raw_recs = _recommender.recommend(prefs, top_n=10, exclude_urls=[])
+            rag_listings = [_serialize(r) for r in raw_recs]
+            # If no results with filters, fall back to top listings without filter
+            if not rag_listings:
+                raw_recs = _recommender.recommend(_map_filters({}), top_n=10, exclude_urls=[])
+                rag_listings = [_serialize(r) for r in raw_recs]
+            # Last resort: load directly from dataframe
+            if not rag_listings and hasattr(_recommender, "df") and _recommender.df is not None:
+                rag_listings = [_serialize(r) for r in _recommender.df.head(10).to_dict(orient="records")]
+        except Exception as rag_err:
+            print(f"[RAG] recommender error: {rag_err}")
+            try:
+                if hasattr(_recommender, "df") and _recommender.df is not None:
+                    rag_listings = [_serialize(r) for r in _recommender.df.head(10).to_dict(orient="records")]
+            except Exception:
+                pass
+
+        # ── Build context block ────────────────────────────────────────────────
+        def _fmt(lst, label):
+            if not lst:
+                return ""
+            lines = [f"\n\n=== {label} ==="]
+            for i, l in enumerate(lst, 1):
+                price = l.get("price_formatted") or (f"{l.get('price'):,}" if l.get("price") else "N/A")
+                tags  = ", ".join((l.get("tags") or l.get("match_tags") or [])[:5])
+                lines.append(
+                    f"{i}. {l.get('title','Bien')} | {l.get('location','')} | {price} DH"
+                    f" | {l.get('area','')} | {l.get('beds','')} ch | Score: {round(float(l.get('score') or 0)*100)}%"
+                    + (f" | Équipements: {tags}" if tags else "")
+                    + (f"\n   URL: {l.get('url','')}" if l.get('url') else "")
+                )
+            return "\n".join(lines)
+
+        rag_context = _fmt(rag_listings, "ANNONCES PERTINENTES DU CATALOGUE")
+        fav_context = _fmt(saved_listings, "ANNONCES FAVORITES DE L'UTILISATEUR")
+
         client = genai.Client(api_key=api_key)
-        
+
         system_instruction = (
             "Tu es Dari, un assistant immobilier marocain chaleureux, professionnel et expert. "
-            "Tu aides les utilisateurs à affiner leurs critères de recherche et à répondre à leurs questions. "
-            "RÈGLES IMPORTANTES: Ne pose qu'une seule question à la fois. Garde tes réponses très courtes, directes et concises. "
-            "Adopte une approche conversationnelle étape par étape, comme un véritable assistant. "
+            "Tu aides les utilisateurs à trouver le bien idéal, à affiner leurs critères et à répondre à leurs questions. "
+            "Tu peux analyser des images de propriétés et fournir des informations détaillées. "
+            "RÈGLES IMPORTANTES: Ne pose qu'une seule question à la fois. Garde tes réponses courtes, directes et concises. "
+            "Adopte une approche conversationnelle étape par étape. "
             "Ne fais jamais de longues listes de questions. Parle toujours en français de manière conviviale. "
-            "N'utilise JAMAIS de formatage Markdown comme les astérisques (**) pour le texte en gras ou en italique. Formate tout en texte brut simple. "
+            "N'utilise JAMAIS de formatage Markdown (pas d'astérisques, pas de tirets, texte brut uniquement). "
+            "Quand tu analyses une image de propriété, décris: le style architectural, l'état, les équipements visibles, "
+            "l'ambiance, la luminosité, et donne une estimation du standing.\n\n"
+            "AFFICHAGE D'UN BIEN: Quand l'utilisateur demande à voir, afficher ou consulter un bien spécifique que tu viens de mentionner, "
+            "ajoute EXACTEMENT à la toute fin de ta réponse (sans espaces autour) le marqueur [SHOW:URL] en remplaçant URL par l'URL exacte du bien. "
+            "N'explique pas ce marqueur, ne le mentionne pas dans le texte visible. Exemple: [SHOW:https://mubawab.ma/...]\n\n"
+            "BASE DE CONNAISSANCES — utilise ces données réelles pour répondre aux questions sur les biens disponibles, "
+            "les prix, les quartiers et faire des suggestions personnalisées. "
+            "Cite des biens spécifiques (titre, localisation, prix) quand c'est pertinent."
+            + rag_context
+            + fav_context
         )
         if req.filters:
-            system_instruction += f"Voici les préférences actuelles de l'utilisateur : {req.filters}."
+            system_instruction += f"\n\nPréférences actuelles de l'utilisateur : {req.filters}."
             
         # Format the history for GenAI
         contents = []
         for msg in req.messages:
             role = "user" if msg.type == "user" else "model"
-            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg.text)]))
+            parts = []
+            
+            # Add text part if present
+            if msg.text:
+                parts.append(types.Part.from_text(text=msg.text))
+            
+            # Add image part if present
+            if hasattr(msg, 'image') and msg.image:
+                try:
+                    # Extract base64 data and mime type from data URL
+                    if msg.image.startswith('data:'):
+                        # Format: data:image/jpeg;base64,/9j/4AAQ...
+                        header, base64_data = msg.image.split(',', 1)
+                        mime_type = header.split(':')[1].split(';')[0]
+                    else:
+                        # Assume it's raw base64 and default to jpeg
+                        base64_data = msg.image
+                        mime_type = 'image/jpeg'
+                    
+                    # Decode base64 to bytes
+                    image_bytes = base64.b64decode(base64_data)
+                    
+                    # Add image using from_bytes
+                    parts.append(types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type=mime_type
+                    ))
+                except Exception as img_error:
+                    print(f"Error processing image: {img_error}")
+                    # Continue without the image if there's an error
+            
+            if parts:  # Only add if there are parts
+                contents.append(types.Content(role=role, parts=parts))
 
+        # Use the same model that was working before (gemini-2.5-flash)
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=contents,
@@ -1262,10 +2064,96 @@ def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
             ),
         )
 
-        return {"reply": response.text}
+        import re
+        raw_reply = response.text or ""
+
+        # ── Detect which listing to show ──────────────────────────────────────
+        # Strategy 1: Gemini emitted [SHOW:url] marker
+        # Strategy 2: User message signals display intent → attach best RAG match
+        DISPLAY_KEYWORDS = [
+            "affiche", "afficher", "montrer", "montre", "voir", "consulter",
+            "show", "display", "voir ce bien", "je veux le voir", "oui", "ok",
+        ]
+        last_user_text = next(
+            (m.text.lower() for m in reversed(req.messages) if m.type == "user"), ""
+        )
+        user_wants_display = any(kw in last_user_text for kw in DISPLAY_KEYWORDS)
+
+        all_candidates = rag_listings + saved_listings
+        show_listing = None
+
+        # Strategy 1: parse Gemini's [SHOW:url] marker (fuzzy URL match)
+        show_match = re.search(r'\[SHOW:([^\]]+)\]', raw_reply)
+        if show_match:
+            show_url = show_match.group(1).strip()
+            # Exact match first, then partial
+            show_listing = (
+                next((l for l in all_candidates if l.get("url") == show_url), None)
+                or next((l for l in all_candidates if show_url in (l.get("url") or "") or (l.get("url") or "") in show_url), None)
+            )
+            raw_reply = re.sub(r'\s*\[SHOW:[^\]]*\]', '', raw_reply).strip()
+
+        # Strategy 2: user asked to display + Gemini's reply mentions a listing title
+        if not show_listing and user_wants_display and all_candidates:
+            reply_lower = raw_reply.lower()
+            # Try to match a candidate whose title/location words appear in the reply
+            for candidate in all_candidates:
+                title_words = [w for w in (candidate.get("title") or "").lower().split() if len(w) > 3]
+                if title_words and sum(1 for w in title_words if w in reply_lower) >= 1:
+                    show_listing = candidate
+                    break
+            # Fallback: return top RAG listing, or fetch raw listings if RAG was empty
+            if not show_listing and user_wants_display:
+                if all_candidates:
+                    show_listing = all_candidates[0]
+                else:
+                    try:
+                        raw_all = _recommender.df.head(1).to_dict(orient="records") if hasattr(_recommender, "df") else []
+                        show_listing = _serialize(raw_all[0]) if raw_all else None
+                    except Exception:
+                        pass
+
+        # ── Auto-save conversation ─────────────────────────────────────────────
+        try:
+            all_msgs = [{"id": m.id, "type": m.type, "text": m.text} for m in req.messages]
+            all_msgs.append({"id": f"bot-{len(all_msgs)}", "type": "bot", "text": raw_reply})
+            if req.conversation_id:
+                conv = db.query(ChatConversation).filter(
+                    ChatConversation.id == req.conversation_id,
+                    ChatConversation.user_id == current_user.id,
+                ).first()
+                if conv:
+                    conv.messages = json.dumps(all_msgs)
+                    db.commit()
+            else:
+                # Backward compat: save to most recent conversation, or create one
+                conv = (
+                    db.query(ChatConversation)
+                    .filter(ChatConversation.user_id == current_user.id)
+                    .order_by(ChatConversation.updated_at.desc())
+                    .first()
+                )
+                if conv:
+                    conv.messages = json.dumps(all_msgs)
+                else:
+                    conv = ChatConversation(
+                        user_id=current_user.id, messages=json.dumps(all_msgs), lang="EN"
+                    )
+                    db.add(conv)
+                db.commit()
+        except Exception as save_err:
+            print(f"[chat] conversation save error: {save_err}")
+
+        result = {"reply": raw_reply}
+        if show_listing:
+            result["listing"] = show_listing
+        return result
     except Exception as e:
         import traceback
+        print("=" * 60)
+        print("CHAT ERROR:")
         traceback.print_exc()
+        print("=" * 60)
         return {"reply": "Désolé, je rencontre des difficultés techniques à me connecter à mon réseau intelligent."}
 
 

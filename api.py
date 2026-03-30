@@ -162,15 +162,23 @@ _default_origins = [
     "http://localhost:3000", "http://localhost:5173",
     "http://127.0.0.1:3000", "http://127.0.0.1:5173",
 ]
-if _cors_env and _cors_env != "*":
-    allowed_origins = list({o.strip() for o in _cors_env.split(",") if o.strip()} | set(_default_origins))
+
+if _cors_env == "*":
+    # Allow all origins (useful for open dev/staging)
+    _allow_origins = ["*"]
+    _allow_credentials = False
+elif _cors_env:
+    # Merge env-supplied origins with localhost defaults
+    _allow_origins = list({o.strip() for o in _cors_env.split(",") if o.strip()} | set(_default_origins))
+    _allow_credentials = True
 else:
-    allowed_origins = _default_origins
+    _allow_origins = _default_origins
+    _allow_credentials = True
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
